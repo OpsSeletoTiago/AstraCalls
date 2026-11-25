@@ -435,12 +435,13 @@ func widgetAllowed(r *http.Request) bool {
 		return true
 	case r.Method == http.MethodGet && p == "/api/chatwoot/resolve": // nome/telefone do contato
 		return true
+	}
 	// operações de chamada: iniciar, atender/recusar, webrtc, vídeo, encerrar
 	// (/api/sessions/{sid}/calls e abaixo). Não abre a gestão de sessões em si.
-	case strings.HasPrefix(p, "/api/sessions/") && strings.Contains(p, "/calls"):
-		return true
-	}
-	return false
+	// Confere o SEGMENTO logo após o {sid}, no caminho como o roteador o vê
+	// (escapado): "calls" em qualquer outro ponto do caminho não conta.
+	seg := strings.Split(r.URL.EscapedPath(), "/")
+	return len(seg) > 4 && seg[1] == "api" && seg[2] == "sessions" && seg[4] == "calls"
 }
 
 // staticFileHandler serve o painel estático.
