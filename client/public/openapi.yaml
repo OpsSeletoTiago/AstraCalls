@@ -146,8 +146,11 @@ components:
         name: { type: string, example: "SDR RAILA" }
         color: { type: integer, minimum: 0, maximum: 19, example: 4, description: "índice da cor na paleta do WhatsApp (0 a 19)" }
         predefinedId: { type: integer, description: "só nas etiquetas de fábrica do WhatsApp Business" }
-        deleted: { type: boolean, description: "só aparece com ?deleted=true" }
+        type: { type: string, example: custom, description: "tipo no app state, quando informado: custom, predefined ou o nome de uma lista do WhatsApp (unread, favorites, groups…)" }
+        immutable: { type: boolean, description: "o WhatsApp não deixa alterar" }
+        deleted: { type: boolean, description: "só aparece com ?all=true" }
         chats: { type: integer, description: "quantas conversas têm a etiqueta" }
+        action: { type: object, description: "registro completo no app state (só com ?raw=true)" }
     SessionOptions:
       type: object
       properties:
@@ -695,9 +698,15 @@ paths:
         state da conta; o AstraCalls mantém um espelho, atualizado pelos eventos da conta.
         Na **primeira chamada** de uma sessão o espelho é lido por inteiro do WhatsApp (full sync
         da coleção `regular`), o que pode levar alguns segundos. `syncedAt` diz quando foi essa leitura.
+        O espelho vale por 24 h (`WACALLS_LABELS_RESYNC_HOURS`; 0 desliga): passado o prazo, o
+        próximo uso relê tudo. Se a leitura falhar, as rotas respondem **503** com `Retry-After`
+        por 1 minuto em vez de repetir o full sync a cada pedido.
+        O mesmo índice guarda as **listas** do WhatsApp (não lidas, favoritos, grupos…). Elas só
+        aparecem com `all=true` e não podem ser alteradas nem aplicadas pela API.
       parameters:
         - { $ref: "#/components/parameters/Sid" }
-        - { name: deleted, in: query, required: false, schema: { type: boolean }, description: "true = inclui as etiquetas apagadas" }
+        - { name: all, in: query, required: false, schema: { type: boolean }, description: "true = inclui as apagadas e as listas do WhatsApp" }
+        - { name: raw, in: query, required: false, schema: { type: boolean }, description: "true = inclui o registro completo de cada etiqueta (`action`)" }
       responses:
         "200":
           description: OK
@@ -709,6 +718,7 @@ paths:
                   syncedAt: { type: integer, format: int64, description: "ms; última leitura completa do WhatsApp" }
                   labels: { type: array, items: { $ref: "#/components/schemas/Label" } }
         "409": { description: Sessão desconectada do WhatsApp }
+        "503": { description: "A última leitura das etiquetas falhou; aguarde o Retry-After" }
     post:
       tags: [Etiquetas]
       summary: Cria uma etiqueta
@@ -747,10 +757,14 @@ paths:
       responses:
         "200": { description: "OK (mesmo formato do GET /labels)" }
         "429": { description: O WhatsApp pediu para aguardar antes de sincronizar de novo }
+        "503": { description: "A última leitura falhou há menos de 1 minuto; aguarde o Retry-After" }
   /api/sessions/{sid}/labels/{labelId}:
     put:
       tags: [Etiquetas]
       summary: Renomeia ou troca a cor de uma etiqueta
+      description: |
+        Os demais campos do registro (ordem, tipo…) são preservados. Listas do WhatsApp e
+        etiquetas imutáveis respondem **409**.
       parameters:
         - { $ref: "#/components/parameters/Sid" }
         - { name: labelId, in: path, required: true, schema: { type: string } }
@@ -787,6 +801,8 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/Sid" }
         - { name: labelId, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 200, maximum: 1000 } }
+        - { name: offset, in: query, required: false, schema: { type: integer, default: 0 } }
       responses:
         "200":
           description: OK
@@ -826,6 +842,7 @@ paths:
         O índice do app state leva o JID da conversa **como o aparelho a guarda** (telefone ou LID).
         Sem `addressing`, o AstraCalls segue a forma que o aparelho já usou nas conversas
         etiquetadas e, na falta delas, se a conta já migrou as conversas para LID.
+        Sessão ainda sem app state sincronizado responde **503**.
       parameters:
         - { $ref: "#/components/parameters/Sid" }
         - { name: chatId, in: path, required: true, schema: { type: string }, description: "Número ou JID do chat" }
@@ -840,6 +857,7 @@ paths:
                 type: object
                 properties:
                   chat: { type: string, description: "JID usado no patch" }
+                  chats: { type: array, items: { type: string }, description: "todos os JIDs do patch (ao tirar, a conversa pode estar etiquetada sob telefone e LID)" }
                   labelId: { type: string }
                   labeled: { type: boolean }
         "404": { description: Etiqueta não encontrada }

@@ -1,14 +1,23 @@
 package main
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
+
+func listType(t waSyncAction.LabelEditAction_ListType) *waSyncAction.LabelEditAction_ListType {
+	return &t
+}
 
 func TestNextLabelID(t *testing.T) {
 	if got := nextLabelID(nil); got != "1" {
@@ -52,7 +61,7 @@ func TestCleanLabelName(t *testing.T) {
 	}
 }
 
-func TestValidLabelColor(t *testing.T) {
+func TestValidLabelColorAndAddressing(t *testing.T) {
 	for _, c := range []int32{0, 7, 19} {
 		if !validLabelColor(c) {
 			t.Fatalf("cor %d deveria valer", c)
@@ -63,19 +72,43 @@ func TestValidLabelColor(t *testing.T) {
 			t.Fatalf("cor %d não deveria valer", c)
 		}
 	}
+	for _, a := range []string{"", "pn", "lid"} {
+		if !validLabelAddressing(a) {
+			t.Fatalf("addressing %q deveria valer", a)
+		}
+	}
+	if validLabelAddressing("telefone") {
+		t.Fatal("addressing desconhecido tem de ser recusado, não ignorado")
+	}
 }
 
-func TestFindLabelByName(t *testing.T) {
-	ls := []waLabel{{ID: "1", Name: "SDR Raila", Deleted: true}, {ID: "7", Name: " sdr raila "}, {ID: "8", Name: "FB300"}}
+// O índice de etiquetas guarda também as listas do WhatsApp. Só etiqueta de
+// usuário entra na listagem padrão, na contagem do limite e na busca por nome.
+func TestUserLabelsLeaveSystemListsOut(t *testing.T) {
+	ls := []waLabel{
+		newLabel("1", &waSyncAction.LabelEditAction{Name: proto.String("Novo cliente"), PredefinedID: proto.Int32(1), Type: listType(waSyncAction.LabelEditAction_PREDEFINED)}),
+		newLabel("2", &waSyncAction.LabelEditAction{Name: proto.String("SDR Raila"), Deleted: proto.Bool(true), Type: listType(waSyncAction.LabelEditAction_CUSTOM)}),
+		newLabel("7", &waSyncAction.LabelEditAction{Name: proto.String(" sdr raila "), Type: listType(waSyncAction.LabelEditAction_CUSTOM)}),
+		newLabel("8", &waSyncAction.LabelEditAction{Name: proto.String("FB300")}), // registro antigo, sem tipo
+		newLabel("9", &waSyncAction.LabelEditAction{Name: proto.String("Favoritos"), Type: listType(waSyncAction.LabelEditAction_FAVORITES)}),
+		{ID: "10", Name: "sem registro"}, // veio de versão que não guardava o registro
+	}
+	got := ""
+	for _, l := range userLabels(ls) {
+		got += l.ID + ","
+	}
+	if got != "1,7,8,10," {
+		t.Fatalf("esperado só etiqueta de usuário viva (1,7,8,10), veio %s", got)
+	}
+	if ls[4].isUserLabel() || ls[4].Type != "favorites" {
+		t.Fatalf("lista do WhatsApp não é etiqueta de usuário: %+v", ls[4])
+	}
 	l, ok := findLabelByName(ls, "SDR RAILA")
 	if !ok || l.ID != "7" {
 		t.Fatalf("deveria achar a viva (7), ignorando a apagada e a caixa: %+v %v", l, ok)
 	}
-	if _, ok := findLabelByName(ls, "SDR THIAGO"); ok {
-		t.Fatal("não existe etiqueta com esse nome")
-	}
-	if n := countLiveLabels(ls); n != 2 {
-		t.Fatalf("2 etiquetas vivas, veio %d", n)
+	if _, ok := findLabelByName(ls, "favoritos"); ok {
+		t.Fatal("lista do WhatsApp não pode ser devolvida como etiqueta existente")
 	}
 }
 
@@ -94,7 +127,6 @@ func TestPickLabelAddressing(t *testing.T) {
 		{"sem histórico, conta migrada usa lid", "", 0, 0, true, "lid"},
 		{"sem histórico, conta não migrada usa telefone", "", 0, 0, false, "pn"},
 		{"empate cai na migração", "", 3, 3, true, "lid"},
-		{"pedido desconhecido é ignorado", "outro", 0, 2, true, "pn"},
 	}
 	for _, c := range cases {
 		if got := pickLabelAddressing(c.asked, c.lidSeen, c.pnSeen, c.migrated); got != c.want {
@@ -106,56 +138,147 @@ func TestPickLabelAddressing(t *testing.T) {
 func TestLabelFromEdit(t *testing.T) {
 	l := labelFromEdit(&events.LabelEdit{LabelID: "9", Action: &waSyncAction.LabelEditAction{
 		Name: proto.String("SDR THIAGO"), Color: proto.Int32(4), PredefinedID: proto.Int32(2), Deleted: proto.Bool(true),
+		IsImmutable: proto.Bool(true), Type: listType(waSyncAction.LabelEditAction_CUSTOM),
 	}})
-	if l.ID != "9" || l.Name != "SDR THIAGO" || l.Color != 4 || l.PredefinedID != 2 || !l.Deleted {
+	if l.ID != "9" || l.Name != "SDR THIAGO" || l.Color != 4 || l.PredefinedID != 2 || !l.Deleted || !l.Immutable || l.Type != "custom" {
 		t.Fatalf("mapeamento errado: %+v", l)
 	}
-	// mutação de remoção chega sem Action: não pode dar panic
-	if l := labelFromEdit(&events.LabelEdit{LabelID: "3"}); l.ID != "3" || l.Name != "" || l.Deleted {
+	// mutação sem Action não pode dar panic
+	if l := labelFromEdit(&events.LabelEdit{LabelID: "3"}); l.ID != "3" || l.Name != "" || l.Deleted || !l.isUserLabel() {
 		t.Fatalf("evento sem action deveria sair zerado: %+v", l)
 	}
 }
 
-func TestBuildLabelEditPatch(t *testing.T) {
-	p := buildLabelEditPatch(waLabel{ID: "6", Name: "FB300", Color: 3})
+// Um SET troca o valor inteiro do índice: renomear não pode apagar os campos
+// que a API não conhece (ordem, ativo, tipo, predefinedID).
+func TestEditedLabelActionPreservesRecord(t *testing.T) {
+	orig := &waSyncAction.LabelEditAction{
+		Name: proto.String("SDR RAILA"), Color: proto.Int32(2), Deleted: proto.Bool(false),
+		OrderIndex: proto.Int32(7), IsActive: proto.Bool(true), PredefinedID: proto.Int32(3),
+		Type: listType(waSyncAction.LabelEditAction_CUSTOM),
+	}
+	l := newLabel("6", orig)
+	l.Name, l.Color = "SDR THIAGO", 9
+	act := editedLabelAction(l)
+	if act.GetName() != "SDR THIAGO" || act.GetColor() != 9 || act.GetDeleted() {
+		t.Fatalf("nome/cor novos não entraram: %+v", act)
+	}
+	if act.GetOrderIndex() != 7 || !act.GetIsActive() || act.GetPredefinedID() != 3 || act.GetType() != waSyncAction.LabelEditAction_CUSTOM {
+		t.Fatalf("campos do registro deveriam ser preservados: %+v", act)
+	}
+	if orig.GetName() != "SDR RAILA" {
+		t.Fatal("o registro original não pode ser alterado (a edição parte de uma cópia)")
+	}
+	// apagar também parte do registro
+	l.Deleted = true
+	if act := editedLabelAction(l); !act.GetDeleted() || act.GetOrderIndex() != 7 {
+		t.Fatalf("apagar deveria manter o registro e marcar deleted: %+v", act)
+	}
+	// etiqueta sem registro guardado: sai o essencial, com o predefinedID que houver
+	act = editedLabelAction(waLabel{ID: "1", Name: "Novo cliente", PredefinedID: 1})
+	if act.GetName() != "Novo cliente" || act.GetPredefinedID() != 1 || act.Type != nil {
+		t.Fatalf("registro mínimo errado: %+v", act)
+	}
+}
+
+func TestNewLabelActionFollowsDeviceMold(t *testing.T) {
+	// conta sem etiqueta criada no aparelho: só o essencial
+	act := newLabelAction("FB300", 3, nil)
+	if act.GetName() != "FB300" || act.GetColor() != 3 || act.GetDeleted() || act.Type != nil || act.OrderIndex != nil || act.IsActive != nil {
+		t.Fatalf("sem molde deveria sair só nome/cor/deleted: %+v", act)
+	}
+	// com etiquetas do aparelho: a nova segue o tipo/ativo delas e entra no fim da ordem
+	known := []waLabel{
+		newLabel("1", &waSyncAction.LabelEditAction{Name: proto.String("Novo cliente"), OrderIndex: proto.Int32(9), Type: listType(waSyncAction.LabelEditAction_PREDEFINED)}),
+		newLabel("6", &waSyncAction.LabelEditAction{Name: proto.String("SDR RAILA"), OrderIndex: proto.Int32(4), IsActive: proto.Bool(true), Type: listType(waSyncAction.LabelEditAction_CUSTOM)}),
+		newLabel("7", &waSyncAction.LabelEditAction{Name: proto.String("velha"), Deleted: proto.Bool(true), Type: listType(waSyncAction.LabelEditAction_CUSTOM)}),
+	}
+	act = newLabelAction("SDR THIAGO", 1, known)
+	if act.GetType() != waSyncAction.LabelEditAction_CUSTOM || !act.GetIsActive() || act.GetOrderIndex() != 10 {
+		t.Fatalf("deveria seguir o molde (custom, ativa, ordem 10): %+v", act)
+	}
+}
+
+func TestBuildLabelPatches(t *testing.T) {
+	act := &waSyncAction.LabelEditAction{Name: proto.String("FB300"), Color: proto.Int32(3), Deleted: proto.Bool(false)}
+	p := buildLabelEditPatch("6", act)
 	if p.Type != appstate.WAPatchRegular || len(p.Mutations) != 1 {
 		t.Fatalf("patch deveria ser da coleção regular com 1 mutação: %+v", p)
 	}
 	m := p.Mutations[0]
-	if len(m.Index) != 2 || m.Index[0] != appstate.IndexLabelEdit || m.Index[1] != "6" || m.Version != 3 {
-		t.Fatalf("índice/versão errados: %+v", m)
+	if len(m.Index) != 2 || m.Index[0] != appstate.IndexLabelEdit || m.Index[1] != "6" || m.Version != 3 || m.Value.GetLabelEditAction() != act {
+		t.Fatalf("índice/versão/valor errados: %+v", m)
 	}
-	a := m.Value.GetLabelEditAction()
-	if a.GetName() != "FB300" || a.GetColor() != 3 || a.GetDeleted() || a.PredefinedID != nil {
-		t.Fatalf("ação errada: %+v", a)
+	// mesmo índice e versão do patch que o whatsmeow monta
+	ref := appstate.BuildLabelEdit("6", "FB300", 3, false).Mutations[0]
+	if ref.Index[0] != m.Index[0] || ref.Index[1] != m.Index[1] || ref.Version != m.Version {
+		t.Fatalf("patch divergiu do whatsmeow: %+v x %+v", ref, m)
 	}
-	// etiqueta de fábrica mantém o predefinedID ao ser editada/apagada
-	a = buildLabelEditPatch(waLabel{ID: "1", Name: "Novo cliente", PredefinedID: 1, Deleted: true}).Mutations[0].Value.GetLabelEditAction()
-	if a.GetPredefinedID() != 1 || !a.GetDeleted() {
-		t.Fatalf("predefinedID/deleted deveriam seguir no patch: %+v", a)
+
+	pn := types.NewJID("5547999990000", types.DefaultUserServer)
+	lid := types.NewJID("123456789", types.HiddenUserServer)
+	cp := buildLabelChatsPatch("6", []types.JID{pn, lid}, false)
+	if cp.Type != appstate.WAPatchRegular || len(cp.Mutations) != 2 {
+		t.Fatalf("tirar das duas formas deveria ser um patch com 2 mutações: %+v", cp)
+	}
+	for i, j := range []types.JID{pn, lid} {
+		mu := cp.Mutations[i]
+		if mu.Index[0] != appstate.IndexLabelAssociationChat || mu.Index[1] != "6" || mu.Index[2] != j.String() || mu.Value.GetLabelAssociationAction().GetLabeled() {
+			t.Fatalf("mutação %d errada: %+v", i, mu)
+		}
 	}
 }
 
-func TestLabelSyncCollects(t *testing.T) {
+func TestLabelSyncCollectsLastValue(t *testing.T) {
 	ls := &labelSync{}
-	if ls.addLabel(waLabel{ID: "1"}) || ls.addChat(labelChat{LabelID: "1", ChatJID: "x"}) {
+	chat := labelChat{LabelID: "1", ChatJID: "5511@s.whatsapp.net"}
+	if ls.addLabel(waLabel{ID: "1"}) || ls.addChat(chat, true) {
 		t.Fatal("fora de um full sync nada é recolhido (o evento vai direto ao banco)")
 	}
 	ls.begin()
-	if !ls.addLabel(waLabel{ID: "1"}) || !ls.addChat(labelChat{LabelID: "1", ChatJID: "5511@s.whatsapp.net"}) {
-		t.Fatal("durante o full sync os eventos são recolhidos")
+	// snapshot diz "etiquetada"; um patch seguinte desfaz. Vale o último.
+	ls.addLabel(waLabel{ID: "1", Name: "antigo"})
+	ls.addLabel(waLabel{ID: "1", Name: "novo"})
+	ls.addChat(chat, true)
+	ls.addChat(chat, false)
+	ls.addChat(labelChat{LabelID: "1", ChatJID: "999@lid"}, true)
+	labels, chats := ls.drain(false)
+	if len(labels) != 1 || labels[0].Name != "novo" {
+		t.Fatalf("deveria ficar o último valor da etiqueta: %+v", labels)
 	}
-	labels, chats := ls.take()
-	if len(labels) != 1 || len(chats) != 1 {
-		t.Fatalf("take deveria devolver o recolhido: %d %d", len(labels), len(chats))
+	on := labeledChats(chats)
+	if len(on) != 1 || on[0].ChatJID != "999@lid" {
+		t.Fatalf("a conversa desetiquetada depois não pode voltar: %+v", on)
 	}
-	if ls.addLabel(waLabel{ID: "2"}) {
-		t.Fatal("depois do take a coleta termina")
+	// drain sem stop continua recolhendo (o que chega durante a troca do espelho)
+	if !ls.addLabel(waLabel{ID: "2"}) {
+		t.Fatal("depois do drain(false) a coleta continua")
 	}
-	// um novo sync começa vazio
-	ls.begin()
-	if l, c := ls.take(); len(l) != 0 || len(c) != 0 {
-		t.Fatalf("coleta nova deveria nascer vazia: %d %d", len(l), len(c))
+	late, _ := ls.drain(true)
+	if len(late) != 1 || late[0].ID != "2" {
+		t.Fatalf("o que chegou depois deveria sair no drain final: %+v", late)
+	}
+	if ls.addLabel(waLabel{ID: "3"}) {
+		t.Fatal("depois do drain(true) a coleta termina")
+	}
+}
+
+func TestLabelMirrorFresh(t *testing.T) {
+	old := labelMirrorMaxAge
+	defer func() { labelMirrorMaxAge = old }()
+	labelMirrorMaxAge = 24 * time.Hour
+	if labelMirrorFresh(0) {
+		t.Fatal("espelho nunca lido não é válido")
+	}
+	if !labelMirrorFresh(time.Now().Add(-time.Hour).UnixMilli()) {
+		t.Fatal("espelho de 1 h atrás ainda vale")
+	}
+	if labelMirrorFresh(time.Now().Add(-25 * time.Hour).UnixMilli()) {
+		t.Fatal("espelho de 25 h atrás venceu")
+	}
+	labelMirrorMaxAge = 0 // releitura automática desligada
+	if !labelMirrorFresh(time.Now().Add(-1000 * time.Hour).UnixMilli()) {
+		t.Fatal("com a validade desligada, espelho lido uma vez vale sempre")
 	}
 }
 
@@ -174,15 +297,72 @@ func TestLabelWebhookData(t *testing.T) {
 	if d["isGroup"] != true || !isGroupWebhookEvent("chat_label", d) {
 		t.Fatalf("etiqueta em grupo deveria contar como evento de grupo: %+v", d)
 	}
-	if l := labelWebhookData(waLabel{ID: "4", Name: "FB300", Color: 2, Deleted: true}); l["id"] != "4" || l["name"] != "FB300" || l["deleted"] != true {
+	l := labelWebhookData(newLabel("4", &waSyncAction.LabelEditAction{Name: proto.String("FB300"), Color: proto.Int32(2), Deleted: proto.Bool(true), Type: listType(waSyncAction.LabelEditAction_CUSTOM)}))
+	if l["id"] != "4" || l["name"] != "FB300" || l["deleted"] != true || l["type"] != "custom" {
 		t.Fatalf("payload de etiqueta errado: %+v", l)
 	}
 }
 
+func TestWriteLabelErrorStatus(t *testing.T) {
+	cases := []struct {
+		err        error
+		code       int
+		retryAfter bool
+	}{
+		{errLabelNotFound, http.StatusNotFound, false},
+		{errLabelsOffline, http.StatusConflict, false},
+		{errLabelLimit, http.StatusConflict, false},
+		{errLabelSystem, http.StatusConflict, false},
+		{errLabelName, http.StatusBadRequest, false},
+		{errLabelAddressing, http.StatusBadRequest, false},
+		{whatsmeow.ErrAppStateRateLimited, http.StatusTooManyRequests, true},
+		{errLabelSyncWait, http.StatusServiceUnavailable, true},
+		{errLabelNotReady, http.StatusServiceUnavailable, true},
+		{labelStoreErr(errors.New("conexão caiu")), http.StatusInternalServerError, false},
+		{errors.New("erro do WhatsApp"), http.StatusBadGateway, false},
+	}
+	for _, c := range cases {
+		w := httptest.NewRecorder()
+		writeLabelError(w, c.err)
+		if w.Code != c.code {
+			t.Errorf("%v: esperado %d, veio %d", c.err, c.code, w.Code)
+		}
+		if got := w.Header().Get("Retry-After") != ""; got != c.retryAfter {
+			t.Errorf("%v: Retry-After presente=%v, esperado %v", c.err, got, c.retryAfter)
+		}
+	}
+	if labelStoreErr(nil) != nil {
+		t.Fatal("sem erro de banco, sem erro")
+	}
+}
+
 // Evento de etiqueta numa sessão sem store (testes, sessão ainda montando) não
-// pode derrubar o tratamento dos outros eventos.
+// pode derrubar o tratamento dos outros eventos; e evento que não é de etiqueta
+// passa direto.
 func TestHandleLabelEventWithoutStore(t *testing.T) {
 	s := &Session{}
 	s.handleLabelEvent(&events.LabelEdit{LabelID: "1"})
+	s.handleLabelEvent(&events.LabelAssociationChat{LabelID: "1"})
 	s.handleLabelEvent(&events.LoggedOut{})
+	s.handleLabelEvent(&events.PairSuccess{})
+	s.handleLabelEvent(&events.Message{})
+}
+
+// As rotas de etiqueta exigem a chave-mestra: a chave de widget só abre as
+// rotas de chamada, mesmo que o chatId traga "/calls" escapado.
+func TestLabelRoutesNeedMasterKey(t *testing.T) {
+	paths := []struct{ method, path string }{
+		{"GET", "/api/sessions/abc/labels"},
+		{"POST", "/api/sessions/abc/labels/sync"},
+		{"PUT", "/api/sessions/abc/chats/5547999990000/labels/1"},
+		{"PUT", "/api/sessions/abc/chats/5547999990000%2Fcalls/labels/1"},
+		{"GET", "/api/sessions/abc/chats/5547999990000%2Fcalls/labels"},
+		{"GET", "/api/sessions/abc/chats/5547999990000%2Fcalls/messages"},
+		{"DELETE", "/api/sessions/abc/labels/%2Fcalls"},
+	}
+	for _, c := range paths {
+		if widgetAllowed(httptest.NewRequest(c.method, c.path, nil)) {
+			t.Errorf("chave de widget NÃO deveria abrir %s %s", c.method, c.path)
+		}
+	}
 }
