@@ -227,6 +227,16 @@ func (s *server) routes() http.Handler {
 	// Opções da conta: ler mensagens automaticamente / sempre online
 	mux.HandleFunc("GET /api/sessions/{sid}/options", s.handleGetOptions)
 	mux.HandleFunc("PUT /api/sessions/{sid}/options", s.handleSetOptions)
+	// Etiquetas do WhatsApp Business (conta e conversa)
+	mux.HandleFunc("GET /api/sessions/{sid}/labels", s.handleListLabels)
+	mux.HandleFunc("POST /api/sessions/{sid}/labels", s.handleCreateLabel)
+	mux.HandleFunc("POST /api/sessions/{sid}/labels/sync", s.handleSyncLabels)
+	mux.HandleFunc("PUT /api/sessions/{sid}/labels/{labelId}", s.handleUpdateLabel)
+	mux.HandleFunc("DELETE /api/sessions/{sid}/labels/{labelId}", s.handleDeleteLabel)
+	mux.HandleFunc("GET /api/sessions/{sid}/labels/{labelId}/chats", s.handleLabelChats)
+	mux.HandleFunc("GET /api/sessions/{sid}/chats/{chatId}/labels", s.handleChatLabels)
+	mux.HandleFunc("PUT /api/sessions/{sid}/chats/{chatId}/labels/{labelId}", s.handleSetChatLabel(true))
+	mux.HandleFunc("DELETE /api/sessions/{sid}/chats/{chatId}/labels/{labelId}", s.handleSetChatLabel(false))
 	// Votar numa enquete recebida
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/poll-vote", s.handlePollVote)
 	// Responder (RSVP) um evento recebido

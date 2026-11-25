@@ -59,6 +59,8 @@ tags:
     description: Criar comunidades, vincular/desvincular grupos, listar grupos e membros
   - name: Canais
     description: Canais/Newsletters (seguir, silenciar, mensagens)
+  - name: Etiquetas
+    description: "Etiquetas do WhatsApp Business: listar, criar, renomear, apagar e etiquetar conversas (aparecem no aparelho)"
   - name: Presença & Perfil
     description: Presença (online/digitando), perfil próprio e status/stories
   - name: Webhook
@@ -137,6 +139,15 @@ components:
       schema: { type: string }
       description: Número ou JID do chat.
   schemas:
+    Label:
+      type: object
+      properties:
+        id: { type: string, example: "7", description: "id da etiqueta na conta (numérico, em texto)" }
+        name: { type: string, example: "SDR RAILA" }
+        color: { type: integer, minimum: 0, maximum: 19, example: 4, description: "índice da cor na paleta do WhatsApp (0 a 19)" }
+        predefinedId: { type: integer, description: "só nas etiquetas de fábrica do WhatsApp Business" }
+        deleted: { type: boolean, description: "só aparece com ?deleted=true" }
+        chats: { type: integer, description: "quantas conversas têm a etiqueta" }
     SessionOptions:
       type: object
       properties:
@@ -675,6 +686,174 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/SessionOptions" }
+  /api/sessions/{sid}/labels:
+    get:
+      tags: [Etiquetas]
+      summary: Lista as etiquetas da conta
+      description: |
+        Etiquetas do **WhatsApp Business** (as que o aparelho mostra na conversa). Vivem no app
+        state da conta; o AstraCalls mantém um espelho, atualizado pelos eventos da conta.
+        Na **primeira chamada** de uma sessão o espelho é lido por inteiro do WhatsApp (full sync
+        da coleção `regular`), o que pode levar alguns segundos. `syncedAt` diz quando foi essa leitura.
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { name: deleted, in: query, required: false, schema: { type: boolean }, description: "true = inclui as etiquetas apagadas" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  syncedAt: { type: integer, format: int64, description: "ms; última leitura completa do WhatsApp" }
+                  labels: { type: array, items: { $ref: "#/components/schemas/Label" } }
+        "409": { description: Sessão desconectada do WhatsApp }
+    post:
+      tags: [Etiquetas]
+      summary: Cria uma etiqueta
+      description: |
+        Se já existe uma etiqueta com o mesmo nome (sem diferenciar maiúsculas), devolve **200**
+        com ela em vez de duplicar. O WhatsApp Business aceita até 20 etiquetas por conta.
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 100, example: "SDR RAILA" }
+                color: { type: integer, minimum: 0, maximum: 19, example: 4 }
+      responses:
+        "201":
+          description: Criada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Label" }
+        "200": { description: Já existia uma etiqueta com esse nome }
+        "409": { description: "Limite de 20 etiquetas, ou sessão desconectada" }
+  /api/sessions/{sid}/labels/sync:
+    post:
+      tags: [Etiquetas]
+      summary: Relê todas as etiquetas do WhatsApp
+      description: |
+        Força a leitura completa (etiquetas e conversas etiquetadas) e devolve a lista. Use se o
+        espelho parecer desatualizado. Pedidos repetidos em menos de 30 s devolvem o espelho atual.
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+      responses:
+        "200": { description: "OK (mesmo formato do GET /labels)" }
+        "429": { description: O WhatsApp pediu para aguardar antes de sincronizar de novo }
+  /api/sessions/{sid}/labels/{labelId}:
+    put:
+      tags: [Etiquetas]
+      summary: Renomeia ou troca a cor de uma etiqueta
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { name: labelId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 100 }
+                color: { type: integer, minimum: 0, maximum: 19 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Label" }
+        "404": { description: Etiqueta não encontrada }
+    delete:
+      tags: [Etiquetas]
+      summary: Apaga uma etiqueta da conta
+      description: A etiqueta some também de todas as conversas.
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { name: labelId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+        "404": { description: Etiqueta não encontrada }
+  /api/sessions/{sid}/labels/{labelId}/chats:
+    get:
+      tags: [Etiquetas]
+      summary: Conversas que têm a etiqueta
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { name: labelId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  label: { $ref: "#/components/schemas/Label" }
+                  chats:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        chat: { type: string, description: "JID como o aparelho guarda a conversa (telefone ou LID)" }
+                        phone: { type: string, description: "telefone, quando conhecido" }
+                        name: { type: string }
+  /api/sessions/{sid}/chats/{chatId}/labels:
+    get:
+      tags: [Etiquetas]
+      summary: Etiquetas de uma conversa
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { name: chatId, in: path, required: true, schema: { type: string }, description: "Número ou JID do chat" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Label" } }
+  /api/sessions/{sid}/chats/{chatId}/labels/{labelId}:
+    put:
+      tags: [Etiquetas]
+      summary: Etiqueta a conversa
+      description: |
+        A etiqueta aparece na conversa no aparelho e nos outros dispositivos da conta.
+        O índice do app state leva o JID da conversa **como o aparelho a guarda** (telefone ou LID).
+        Sem `addressing`, o AstraCalls segue a forma que o aparelho já usou nas conversas
+        etiquetadas e, na falta delas, se a conta já migrou as conversas para LID.
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { name: chatId, in: path, required: true, schema: { type: string }, description: "Número ou JID do chat" }
+        - { name: labelId, in: path, required: true, schema: { type: string } }
+        - { name: addressing, in: query, required: false, schema: { type: string, enum: [pn, lid] }, description: "Força o endereço: pn (telefone) ou lid" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chat: { type: string, description: "JID usado no patch" }
+                  labelId: { type: string }
+                  labeled: { type: boolean }
+        "404": { description: Etiqueta não encontrada }
+    delete:
+      tags: [Etiquetas]
+      summary: Tira a etiqueta da conversa
+      parameters:
+        - { $ref: "#/components/parameters/Sid" }
+        - { name: chatId, in: path, required: true, schema: { type: string }, description: "Número ou JID do chat" }
+        - { name: labelId, in: path, required: true, schema: { type: string } }
+        - { name: addressing, in: query, required: false, schema: { type: string, enum: [pn, lid] } }
+      responses:
+        "200": { description: OK }
+        "404": { description: Etiqueta não encontrada }
   /api/sessions/{sid}/proxy:
     get:
       tags: [Sessões]
@@ -1614,6 +1793,9 @@ paths:
         `event` pode ser `message` (mensagem recebida, com `data.text`, `data.type`, `data.raw`...),
         `receipt` (confirmações de entrega/leitura) ou `group_participants` (entrada/saída/promoção
         em grupo, com `data.group`, `data.actor` e as listas `data.joined`/`data.left`/`data.promoted`/`data.demoted`).
+        Etiquetas do WhatsApp Business: `label` (etiqueta criada, alterada ou apagada: `data.id`, `data.name`,
+        `data.color`, `data.deleted`) e `chat_label` (conversa etiquetada ou desetiquetada em qualquer
+        dispositivo da conta: `data.chat`, `data.phone`, `data.labelId`, `data.labelName`, `data.labeled`).
       parameters:
         - { $ref: "#/components/parameters/Sid" }
         - { $ref: "#/components/parameters/ClientId" }

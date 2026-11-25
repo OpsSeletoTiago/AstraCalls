@@ -146,6 +146,11 @@ func newSessionStore(ctx context.Context, db *sql.DB) (*sessionStore, error) {
 		return nil, err
 	}
 
+	// Espelho das etiquetas do WhatsApp Business (ver labels.go).
+	if err := initLabelTables(ctx, db); err != nil {
+		return nil, err
+	}
+
 	return &sessionStore{db: db}, nil
 }
 

@@ -771,6 +771,7 @@ func (s *Session) maybeMarkRead(ctx context.Context, evt *events.Message) {
 
 func (s *Session) handleEvent(rawEvt any) {
 	ctx := context.Background()
+	s.handleLabelEvent(rawEvt) // espelho de etiquetas (labels.go)
 	switch evt := rawEvt.(type) {
 	case *events.Connected:
 		if id := s.client.Store.ID; id != nil {

@@ -116,6 +116,8 @@ roteadas por call ID.
 - **Agendamento** (`/schedule`, persiste e sobrevive a restart), **envio idempotente**
   (`X-Message-ID`), **busca** no histórico, **download de mídia recebida**.
 - **Contatos, grupos, canais, perfil, privacidade, bloqueio, proxy por sessão**.
+- **Etiquetas do WhatsApp Business**: listar, criar, renomear, apagar e etiquetar conversas
+  (`/labels`, `/chats/{chatId}/labels`), com eventos `label` e `chat_label` no webhook.
 
 ### 📢 Disparos em massa
 - `POST /blast`: campanha de texto/imagem com **pacing anti-ban**, status e cancelamento.
