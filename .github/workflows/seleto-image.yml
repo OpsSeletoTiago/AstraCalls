@@ -46,8 +46,16 @@ jobs:
 
       - name: Test
         env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./...
+
+      # O detector de corrida roda só no que é nosso: os testes de SIP do projeto
+      # original (TestSIPRegisterOKHasContact, cmd/sipconnector) já acusam corrida
+      # na versão oficial, e travar a imagem por eles não protege nada daqui.
+      - name: Test com detector de corrida (alterações da Seleto)
+        env:
           CGO_ENABLED: "1"
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -run 'Label|RoutesNoConflict' ./cmd/server/
 
   image:
     name: imagem linux/amd64
