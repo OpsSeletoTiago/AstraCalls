@@ -33,6 +33,9 @@ func TestWidgetAllowedScope(t *testing.T) {
 		{"PUT", "/api/sessions/abc/recording"},     // configurar gravação
 		{"GET", "/api/chatwoot/config"},            // config do chatwoot
 		{"POST", "/api/chatwoot/resolve"},          // resolve só por GET
+		// "calls" fora do segmento logo após o {sid} não é rota de chamada
+		{"GET", "/api/sessions/abc/chats/5547999990000%2Fcalls/messages"},
+		{"GET", "/api/sessions/abc/recordings/calls"},
 	}
 	for _, c := range denied {
 		r := httptest.NewRequest(c.method, c.path, nil)

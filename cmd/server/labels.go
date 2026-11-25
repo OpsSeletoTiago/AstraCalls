@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -32,11 +34,17 @@ import (
 // principal, alimentado de dois jeitos:
 //   - mudanças ao vivo: os eventos chegam e atualizam o espelho;
 //   - o que já existia antes: um full sync da coleção `regular`, feito sob
-//     demanda (primeiro uso da sessão ou POST .../labels/sync).
+//     demanda (primeiro uso da sessão, espelho velho ou POST .../labels/sync).
 //
 // O full sync inicial do pareamento NÃO emite eventos (o padrão do whatsmeow é
 // EmitAppStateEventsOnFullSync=false), então sem esse sync explícito o espelho
-// de uma sessão já pareada nasceria vazio.
+// de uma sessão já pareada nasceria vazio. Pelo mesmo motivo o espelho tem
+// validade: um full sync que o whatsmeow faça por conta própria (recuperação de
+// app state) e uma mutação REMOVE não geram evento nenhum, e só reler corrige.
+//
+// O mesmo índice (`label_edit`) guarda também as LISTAS do WhatsApp (não lidas,
+// favoritos, grupos…), diferenciadas pelo campo `type`. Elas aparecem na
+// listagem completa, mas a API só altera e aplica etiquetas de usuário.
 
 const (
 	// O WhatsApp Business aceita 20 etiquetas por conta e 20 cores (0..19).
@@ -45,35 +53,94 @@ const (
 	labelMaxNameRunes  = 100
 	// Intervalo mínimo entre dois full syncs pedidos pela API na mesma sessão.
 	labelSyncMinInterval = 30 * time.Second
+	// Depois de um full sync que falhou, quanto esperar antes de tentar de novo.
+	// Sem isso cada request repetiria o full sync e o WhatsApp responderia 429.
+	labelSyncBackoff = time.Minute
 	// Prazo de um full sync / de um envio de patch. Não segue o contexto do
 	// request: um sync cortado no meio deixaria a coleção sem versão local.
 	labelSyncTimeout = 90 * time.Second
 	labelSendTimeout = 30 * time.Second
+	// Prazo das gravações do espelho feitas dentro do tratamento de eventos.
+	labelEventDBTimeout = 5 * time.Second
+	labelBodyMaxBytes   = 64 << 10
 )
+
+// labelMirrorMaxAge é a validade do espelho: passado esse tempo, o próximo uso
+// relê tudo do WhatsApp. 0 desliga a releitura automática.
+var labelMirrorMaxAge = time.Duration(envInt("WACALLS_LABELS_RESYNC_HOURS", 24)) * time.Hour
 
 var (
-	errLabelsOffline  = errors.New("sessão desconectada do WhatsApp")
-	errLabelNotFound  = errors.New("etiqueta não encontrada")
-	errLabelLimit     = errors.New("a conta já tem 20 etiquetas, que é o limite do WhatsApp Business")
-	errLabelName      = errors.New("name obrigatório, com até 100 caracteres")
-	errLabelColor     = errors.New("color deve ficar entre 0 e 19")
-	errLabelBadTarget = errors.New("etiqueta de conversa só vale para contato ou grupo")
+	errLabelsOffline   = errors.New("sessão desconectada do WhatsApp")
+	errLabelNotFound   = errors.New("etiqueta não encontrada")
+	errLabelLimit      = errors.New("a conta já tem 20 etiquetas, que é o limite do WhatsApp Business")
+	errLabelName       = errors.New("name obrigatório, com até 100 caracteres")
+	errLabelColor      = errors.New("color deve ficar entre 0 e 19")
+	errLabelAddressing = errors.New("addressing deve ser pn ou lid")
+	errLabelBadTarget  = errors.New("etiqueta de conversa só vale para contato ou grupo")
+	errLabelSystem     = errors.New("esta é uma lista do próprio WhatsApp e não pode ser alterada nem aplicada pela API")
+	errLabelSyncWait   = errors.New("a última leitura das etiquetas falhou; aguarde antes de tentar de novo")
+	errLabelNotReady   = errors.New("o app state da conta ainda não foi sincronizado; tente de novo em instantes")
+	errLabelStore      = errors.New("falha no banco do espelho de etiquetas")
 )
 
-// waLabel é uma etiqueta da conta.
+func labelStoreErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", errLabelStore, err)
+}
+
+// waLabel é uma etiqueta (ou lista) da conta.
 type waLabel struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Color        int32  `json:"color"`
-	PredefinedID int32  `json:"predefinedId,omitempty"` // etiquetas de fábrica do WhatsApp Business
-	Deleted      bool   `json:"deleted,omitempty"`
-	Chats        int    `json:"chats"` // quantas conversas têm a etiqueta
+	ID           string          `json:"id"`
+	Name         string          `json:"name"`
+	Color        int32           `json:"color"`
+	PredefinedID int32           `json:"predefinedId,omitempty"` // etiquetas de fábrica do WhatsApp Business
+	Type         string          `json:"type,omitempty"`         // custom, predefined, unread, favorites…
+	Immutable    bool            `json:"immutable,omitempty"`
+	Deleted      bool            `json:"deleted,omitempty"`
+	Chats        int             `json:"chats"`            // quantas conversas têm a etiqueta
+	Action       json.RawMessage `json:"action,omitempty"` // registro completo no app state (só com ?raw=true)
+
+	// act é o registro completo como veio do app state. Um SET troca o valor
+	// inteiro do índice, então toda edição parte dele para não apagar campos
+	// que esta API não conhece (ordem, ativo, tipo…).
+	act *waSyncAction.LabelEditAction
 }
 
 // labelChat é uma conversa etiquetada.
 type labelChat struct {
 	LabelID string
 	ChatJID string
+}
+
+func newLabel(id string, act *waSyncAction.LabelEditAction) waLabel {
+	l := waLabel{
+		ID:           id,
+		Name:         act.GetName(),
+		Color:        act.GetColor(),
+		PredefinedID: act.GetPredefinedID(),
+		Immutable:    act.GetIsImmutable(),
+		Deleted:      act.GetDeleted(),
+		act:          act,
+	}
+	if act != nil && act.Type != nil {
+		l.Type = strings.ToLower(act.GetType().String())
+	}
+	return l
+}
+
+// isUserLabel diz se é uma etiqueta de usuário (criada no aparelho ou de fábrica
+// do Business), e não uma lista do próprio WhatsApp.
+func (l waLabel) isUserLabel() bool {
+	if l.act == nil || l.act.Type == nil {
+		return true
+	}
+	switch l.act.GetType() {
+	case waSyncAction.LabelEditAction_NONE, waSyncAction.LabelEditAction_PREDEFINED, waSyncAction.LabelEditAction_CUSTOM:
+		return true
+	}
+	return false
 }
 
 // ---------- espelho no banco principal ----------
@@ -85,8 +152,8 @@ func initLabelTables(ctx context.Context, db *sql.DB) error {
 		label_id      TEXT NOT NULL,
 		name          TEXT NOT NULL DEFAULT '',
 		color         INT NOT NULL DEFAULT 0,
-		predefined_id INT NOT NULL DEFAULT 0,
 		deleted       BOOLEAN NOT NULL DEFAULT false,
+		action        BYTEA,
 		updated_at    BIGINT NOT NULL,
 		PRIMARY KEY (session_id, label_id)
 	)`); err != nil {
@@ -102,7 +169,8 @@ func initLabelTables(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	_, _ = db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS wa_label_chats_chat ON wa_label_chats (session_id, chat_jid)`)
-	// Quando o espelho foi lido por inteiro do WhatsApp pela última vez (0 = nunca).
+	// Quando o espelho foi lido por inteiro do WhatsApp pela última vez. Sem
+	// linha = nunca, ou a última leitura falhou e o espelho não é confiável.
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS wa_label_sync (
 		session_id TEXT PRIMARY KEY,
 		synced_at  BIGINT NOT NULL
@@ -116,13 +184,25 @@ func initLabelTables(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+func labelActionBytes(l waLabel) []byte {
+	if l.act == nil {
+		return nil
+	}
+	b, err := proto.Marshal(l.act)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+const labelUpsertSQL = `INSERT INTO wa_labels (session_id, label_id, name, color, deleted, action, updated_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7)
+	ON CONFLICT (session_id, label_id) DO UPDATE SET
+		name = EXCLUDED.name, color = EXCLUDED.color, deleted = EXCLUDED.deleted, updated_at = EXCLUDED.updated_at,
+		action = COALESCE(EXCLUDED.action, wa_labels.action)`
+
 func (s *sessionStore) upsertLabel(ctx context.Context, sid string, l waLabel) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO wa_labels (session_id, label_id, name, color, predefined_id, deleted, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (session_id, label_id) DO UPDATE SET
-			name = EXCLUDED.name, color = EXCLUDED.color, deleted = EXCLUDED.deleted, updated_at = EXCLUDED.updated_at,
-			predefined_id = CASE WHEN EXCLUDED.predefined_id <> 0 THEN EXCLUDED.predefined_id ELSE wa_labels.predefined_id END`,
-		sid, l.ID, l.Name, l.Color, l.PredefinedID, l.Deleted, time.Now().UnixMilli())
+	_, err := s.db.ExecContext(ctx, labelUpsertSQL, sid, l.ID, l.Name, l.Color, l.Deleted, labelActionBytes(l), time.Now().UnixMilli())
 	if err == nil && l.Deleted {
 		// etiqueta apagada some das conversas
 		_, err = s.db.ExecContext(ctx, `DELETE FROM wa_label_chats WHERE session_id = $1 AND label_id = $2`, sid, l.ID)
@@ -158,10 +238,7 @@ func (s *sessionStore) replaceLabels(ctx context.Context, sid string, labels []w
 	deleted := map[string]bool{}
 	for _, l := range labels {
 		deleted[l.ID] = l.Deleted
-		if _, err = tx.ExecContext(ctx, `INSERT INTO wa_labels (session_id, label_id, name, color, predefined_id, deleted, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (session_id, label_id) DO UPDATE SET
-			name = EXCLUDED.name, color = EXCLUDED.color, predefined_id = EXCLUDED.predefined_id, deleted = EXCLUDED.deleted, updated_at = EXCLUDED.updated_at`,
-			sid, l.ID, l.Name, l.Color, l.PredefinedID, l.Deleted, now); err != nil {
+		if _, err = tx.ExecContext(ctx, labelUpsertSQL, sid, l.ID, l.Name, l.Color, l.Deleted, labelActionBytes(l), now); err != nil {
 			return err
 		}
 	}
@@ -179,6 +256,12 @@ func (s *sessionStore) replaceLabels(ctx context.Context, sid string, labels []w
 		return err
 	}
 	return tx.Commit()
+}
+
+// markLabelsUnsynced tira a validade do espelho: a próxima leitura refaz tudo.
+func (s *sessionStore) markLabelsUnsynced(ctx context.Context, sid string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM wa_label_sync WHERE session_id = $1`, sid)
+	return err
 }
 
 // clearLabels zera o espelho da sessão (conta trocada, desvinculada ou apagada).
@@ -201,7 +284,7 @@ func (s *sessionStore) labelsSyncedAt(ctx context.Context, sid string) (int64, e
 	return at, err
 }
 
-const labelSelect = `SELECT l.label_id, l.name, l.color, l.predefined_id, l.deleted,
+const labelSelect = `SELECT l.label_id, l.name, l.color, l.deleted, l.action,
 	(SELECT count(*) FROM wa_label_chats c WHERE c.session_id = l.session_id AND c.label_id = l.label_id)
 	FROM wa_labels l WHERE l.session_id = $1`
 
@@ -209,10 +292,26 @@ func scanLabels(rows *sql.Rows) ([]waLabel, error) {
 	defer rows.Close()
 	out := []waLabel{}
 	for rows.Next() {
-		var l waLabel
-		if err := rows.Scan(&l.ID, &l.Name, &l.Color, &l.PredefinedID, &l.Deleted, &l.Chats); err != nil {
+		var (
+			id, name string
+			color    int32
+			deleted  bool
+			raw      []byte
+			chats    int
+		)
+		if err := rows.Scan(&id, &name, &color, &deleted, &raw, &chats); err != nil {
 			return nil, err
 		}
+		var act *waSyncAction.LabelEditAction
+		if len(raw) > 0 {
+			act = &waSyncAction.LabelEditAction{}
+			if err := proto.Unmarshal(raw, act); err != nil {
+				act = nil
+			}
+		}
+		l := newLabel(id, act)
+		// as colunas valem mais que o registro: são o que a última escrita gravou
+		l.Name, l.Color, l.Deleted, l.Chats = name, color, deleted, chats
 		out = append(out, l)
 	}
 	if err := rows.Err(); err != nil {
@@ -222,31 +321,39 @@ func scanLabels(rows *sql.Rows) ([]waLabel, error) {
 	return out, nil
 }
 
-func (s *sessionStore) listLabels(ctx context.Context, sid string, withDeleted bool) ([]waLabel, error) {
-	q := labelSelect
-	if !withDeleted {
-		q += ` AND NOT l.deleted`
-	}
-	rows, err := s.db.QueryContext(ctx, q, sid)
+// listLabels devolve TUDO o que o espelho tem da sessão: etiquetas de usuário,
+// listas do WhatsApp e as apagadas. Quem chama filtra.
+func (s *sessionStore) listLabels(ctx context.Context, sid string) ([]waLabel, error) {
+	rows, err := s.db.QueryContext(ctx, labelSelect, sid)
 	if err != nil {
 		return nil, err
 	}
 	return scanLabels(rows)
 }
 
+// getLabel devolve uma etiqueta viva (as apagadas contam como inexistentes).
 func (s *sessionStore) getLabel(ctx context.Context, sid, id string) (waLabel, error) {
 	rows, err := s.db.QueryContext(ctx, labelSelect+` AND l.label_id = $2`, sid, id)
 	if err != nil {
-		return waLabel{}, err
+		return waLabel{}, labelStoreErr(err)
 	}
 	ls, err := scanLabels(rows)
 	if err != nil {
-		return waLabel{}, err
+		return waLabel{}, labelStoreErr(err)
 	}
 	if len(ls) == 0 || ls[0].Deleted {
 		return waLabel{}, errLabelNotFound
 	}
 	return ls[0], nil
+}
+
+func jidMarks(first int, jids []string, args []any) (string, []any) {
+	marks := make([]string, len(jids))
+	for i, j := range jids {
+		args = append(args, j)
+		marks[i] = "$" + strconv.Itoa(first+i)
+	}
+	return strings.Join(marks, ","), args
 }
 
 // labelsOfChat devolve as etiquetas de uma conversa, procurando por todos os
@@ -255,22 +362,40 @@ func (s *sessionStore) labelsOfChat(ctx context.Context, sid string, jids []stri
 	if len(jids) == 0 {
 		return []waLabel{}, nil
 	}
-	args := []any{sid}
-	marks := make([]string, len(jids))
-	for i, j := range jids {
-		args = append(args, j)
-		marks[i] = "$" + strconv.Itoa(i+2)
-	}
+	marks, args := jidMarks(2, jids, []any{sid})
 	rows, err := s.db.QueryContext(ctx, labelSelect+` AND NOT l.deleted AND l.label_id IN (
-		SELECT c.label_id FROM wa_label_chats c WHERE c.session_id = $1 AND c.chat_jid IN (`+strings.Join(marks, ",")+`))`, args...)
+		SELECT c.label_id FROM wa_label_chats c WHERE c.session_id = $1 AND c.chat_jid IN (`+marks+`))`, args...)
 	if err != nil {
 		return nil, err
 	}
 	return scanLabels(rows)
 }
 
-func (s *sessionStore) chatsOfLabel(ctx context.Context, sid, labelID string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT chat_jid FROM wa_label_chats WHERE session_id = $1 AND label_id = $2 ORDER BY updated_at DESC`, sid, labelID)
+// labeledAliases diz sob quais dos JIDs dados a conversa está com a etiqueta.
+func (s *sessionStore) labeledAliases(ctx context.Context, sid, labelID string, jids []string) ([]string, error) {
+	if len(jids) == 0 {
+		return nil, nil
+	}
+	marks, args := jidMarks(3, jids, []any{sid, labelID})
+	rows, err := s.db.QueryContext(ctx, `SELECT chat_jid FROM wa_label_chats WHERE session_id = $1 AND label_id = $2 AND chat_jid IN (`+marks+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var j string
+		if err := rows.Scan(&j); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+func (s *sessionStore) chatsOfLabel(ctx context.Context, sid, labelID string, limit, offset int) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT chat_jid FROM wa_label_chats WHERE session_id = $1 AND label_id = $2
+		ORDER BY updated_at DESC, chat_jid LIMIT $3 OFFSET $4`, sid, labelID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -314,8 +439,8 @@ func sortLabels(ls []waLabel) {
 }
 
 // nextLabelID devolve o próximo id livre. O aparelho numera as etiquetas em
-// sequência; seguimos a mesma regra olhando TODAS as conhecidas, inclusive as
-// apagadas, para nunca reaproveitar um id.
+// sequência; seguimos a mesma regra olhando TUDO o que o índice tem (listas e
+// apagadas também), para nunca reaproveitar um id.
 func nextLabelID(known []waLabel) string {
 	maxID := 0
 	for _, l := range known {
@@ -336,24 +461,25 @@ func cleanLabelName(name string) (string, error) {
 
 func validLabelColor(c int32) bool { return c >= 0 && c <= labelMaxColor }
 
-// findLabelByName acha uma etiqueta viva pelo nome, sem diferenciar maiúsculas.
-func findLabelByName(ls []waLabel, name string) (waLabel, bool) {
+// userLabels filtra as etiquetas de usuário vivas (o que a API lista por padrão).
+func userLabels(ls []waLabel) []waLabel {
+	out := make([]waLabel, 0, len(ls))
 	for _, l := range ls {
-		if !l.Deleted && strings.EqualFold(strings.TrimSpace(l.Name), name) {
+		if !l.Deleted && l.isUserLabel() {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// findLabelByName acha uma etiqueta de usuário viva pelo nome, sem diferenciar maiúsculas.
+func findLabelByName(ls []waLabel, name string) (waLabel, bool) {
+	for _, l := range userLabels(ls) {
+		if strings.EqualFold(strings.TrimSpace(l.Name), name) {
 			return l, true
 		}
 	}
 	return waLabel{}, false
-}
-
-func countLiveLabels(ls []waLabel) int {
-	n := 0
-	for _, l := range ls {
-		if !l.Deleted {
-			n++
-		}
-	}
-	return n
 }
 
 // pickLabelAddressing decide sob qual endereço uma conversa 1:1 é etiquetada:
@@ -380,42 +506,87 @@ func pickLabelAddressing(asked string, lidSeen, pnSeen int, migrated bool) strin
 	return "pn"
 }
 
-func labelFromEdit(evt *events.LabelEdit) waLabel {
-	a := evt.Action
-	return waLabel{
-		ID:           evt.LabelID,
-		Name:         a.GetName(),
-		Color:        a.GetColor(),
-		PredefinedID: a.GetPredefinedID(),
-		Deleted:      a.GetDeleted(),
+func validLabelAddressing(a string) bool { return a == "" || a == "pn" || a == "lid" }
+
+func labelFromEdit(evt *events.LabelEdit) waLabel { return newLabel(evt.LabelID, evt.Action) }
+
+// newLabelAction monta o registro de uma etiqueta NOVA. Os campos além de nome
+// e cor seguem os de uma etiqueta que o próprio aparelho criou nesta conta (o
+// molde), para a nova ficar igual às dele; sem molde, vai só o essencial.
+func newLabelAction(name string, color int32, known []waLabel) *waSyncAction.LabelEditAction {
+	act := &waSyncAction.LabelEditAction{Name: proto.String(name), Color: proto.Int32(color), Deleted: proto.Bool(false)}
+	var mold *waSyncAction.LabelEditAction
+	maxOrder, hasOrder := int32(0), false
+	for _, l := range known {
+		if l.act == nil {
+			continue
+		}
+		if l.act.OrderIndex != nil {
+			hasOrder = true
+			if o := l.act.GetOrderIndex(); o > maxOrder {
+				maxOrder = o
+			}
+		}
+		if !l.Deleted && l.act.GetType() == waSyncAction.LabelEditAction_CUSTOM {
+			mold = l.act
+		}
 	}
+	if mold != nil {
+		act.Type = mold.Type
+		act.IsActive = mold.IsActive
+		if mold.OrderIndex != nil && hasOrder {
+			act.OrderIndex = proto.Int32(maxOrder + 1)
+		}
+	}
+	return act
 }
 
-// buildLabelEditPatch monta o patch de criar/renomear/apagar. Igual ao
-// appstate.BuildLabelEdit, mas preserva o predefinedID das etiquetas de fábrica.
-func buildLabelEditPatch(l waLabel) appstate.PatchInfo {
-	act := &waSyncAction.LabelEditAction{
-		Name:    proto.String(l.Name),
-		Color:   proto.Int32(l.Color),
-		Deleted: proto.Bool(l.Deleted),
+// editedLabelAction devolve o registro da etiqueta com nome/cor/apagada novos,
+// preservando todos os outros campos do registro atual.
+func editedLabelAction(l waLabel) *waSyncAction.LabelEditAction {
+	var act *waSyncAction.LabelEditAction
+	if l.act != nil {
+		act = proto.Clone(l.act).(*waSyncAction.LabelEditAction)
+	} else {
+		act = &waSyncAction.LabelEditAction{}
+		if l.PredefinedID != 0 {
+			act.PredefinedID = proto.Int32(l.PredefinedID)
+		}
 	}
-	if l.PredefinedID != 0 {
-		act.PredefinedID = proto.Int32(l.PredefinedID)
-	}
+	act.Name, act.Color, act.Deleted = proto.String(l.Name), proto.Int32(l.Color), proto.Bool(l.Deleted)
+	return act
+}
+
+// buildLabelEditPatch monta o patch de criar/renomear/apagar a partir do
+// registro completo (o appstate.BuildLabelEdit só leva nome, cor e apagada).
+func buildLabelEditPatch(id string, act *waSyncAction.LabelEditAction) appstate.PatchInfo {
 	return appstate.PatchInfo{
 		Type: appstate.WAPatchRegular,
 		Mutations: []appstate.MutationInfo{{
-			Index:   []string{appstate.IndexLabelEdit, l.ID},
+			Index:   []string{appstate.IndexLabelEdit, id},
 			Version: 3,
 			Value:   &waSyncAction.SyncActionValue{LabelEditAction: act},
 		}},
 	}
 }
 
+// buildLabelChatsPatch (des)etiqueta um ou mais JIDs com a mesma etiqueta num patch só.
+func buildLabelChatsPatch(labelID string, targets []types.JID, labeled bool) appstate.PatchInfo {
+	p := appstate.PatchInfo{Type: appstate.WAPatchRegular}
+	for _, t := range targets {
+		p.Mutations = append(p.Mutations, appstate.BuildLabelChat(t, labelID, labeled).Mutations...)
+	}
+	return p
+}
+
 // labelWebhookData é o payload do evento `label`: uma etiqueta foi criada,
 // renomeada, recolorida ou apagada (em qualquer dispositivo da conta).
 func labelWebhookData(l waLabel) map[string]any {
-	return map[string]any{"id": l.ID, "name": l.Name, "color": l.Color, "deleted": l.Deleted}
+	d := map[string]any{"id": l.ID, "name": l.Name, "color": l.Color, "deleted": l.Deleted}
+	if l.Type != "" {
+		d["type"] = l.Type
+	}
+	return d
 }
 
 // chatLabelWebhookData é o payload do evento `chat_label`: uma conversa ganhou
@@ -435,17 +606,23 @@ func chatLabelWebhookData(chat types.JID, phone, labelID, labelName string, labe
 	return d
 }
 
-// ---------- coleta do full sync ----------
+// ---------- estado por sessão ----------
 
-// labelSync guarda, por sessão, a trava do full sync e o balde que recolhe os
-// eventos enquanto um full sync roda (para trocar o espelho de uma vez só).
+// labelSync guarda, por sessão, a trava que serializa full sync e escritas, e o
+// balde que recolhe os eventos enquanto um full sync roda.
 type labelSync struct {
-	run sync.Mutex // um full sync por vez na sessão
+	// run serializa, na sessão, o full sync e toda escrita de etiqueta. Um patch
+	// enviado no meio de um full sync leria a coleção sem versão local, e duas
+	// criações simultâneas calculariam o mesmo id (a segunda sobrescreve a primeira).
+	run sync.Mutex
+	// protegidos por run:
+	lastAttempt time.Time
+	lastErr     error
 
 	mu      sync.Mutex
 	collect bool
-	labels  []waLabel
-	chats   []labelChat
+	labels  map[string]waLabel
+	chats   map[labelChat]bool
 }
 
 var labelSyncs sync.Map // session id -> *labelSync
@@ -457,17 +634,27 @@ func labelSyncFor(sid string) *labelSync {
 
 func (ls *labelSync) begin() {
 	ls.mu.Lock()
-	ls.collect, ls.labels, ls.chats = true, nil, nil
+	ls.collect, ls.labels, ls.chats = true, map[string]waLabel{}, map[labelChat]bool{}
 	ls.mu.Unlock()
 }
 
-// take encerra a coleta e devolve o que foi recolhido.
-func (ls *labelSync) take() ([]waLabel, []labelChat) {
+// drain devolve o que foi recolhido e esvazia o balde; com stop, encerra a coleta.
+// Vale o ÚLTIMO valor de cada chave: um full sync é o snapshot mais os patches
+// seguintes, e um patch pode desfazer o que o snapshot dizia.
+func (ls *labelSync) drain(stop bool) ([]waLabel, map[labelChat]bool) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
-	l, c := ls.labels, ls.chats
-	ls.collect, ls.labels, ls.chats = false, nil, nil
-	return l, c
+	labels := make([]waLabel, 0, len(ls.labels))
+	for _, l := range ls.labels {
+		labels = append(labels, l)
+	}
+	chats := ls.chats
+	if stop {
+		ls.collect, ls.labels, ls.chats = false, nil, nil
+	} else {
+		ls.labels, ls.chats = map[string]waLabel{}, map[labelChat]bool{}
+	}
+	return labels, chats
 }
 
 func (ls *labelSync) addLabel(l waLabel) bool {
@@ -476,52 +663,60 @@ func (ls *labelSync) addLabel(l waLabel) bool {
 	if !ls.collect {
 		return false
 	}
-	ls.labels = append(ls.labels, l)
+	ls.labels[l.ID] = l
 	return true
 }
 
-func (ls *labelSync) addChat(c labelChat) bool {
+func (ls *labelSync) addChat(c labelChat, labeled bool) bool {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 	if !ls.collect {
 		return false
 	}
-	ls.chats = append(ls.chats, c)
+	ls.chats[c] = labeled
 	return true
 }
 
-// handleLabelEvent mantém o espelho de etiquetas em dia. Chamado para todo
-// evento da sessão; ignora o que não é de etiqueta.
-func (s *Session) handleLabelEvent(rawEvt any) {
-	if s.mgr == nil || s.mgr.store == nil {
-		return
+func labeledChats(m map[labelChat]bool) []labelChat {
+	out := make([]labelChat, 0, len(m))
+	for c, on := range m {
+		if on {
+			out = append(out, c)
+		}
 	}
-	ctx := context.Background()
+	return out
+}
+
+// handleLabelEvent mantém o espelho de etiquetas em dia. Chamado para todo
+// evento da sessão; ignora na hora o que não é de etiqueta.
+func (s *Session) handleLabelEvent(rawEvt any) {
 	switch evt := rawEvt.(type) {
 	case *events.LabelEdit:
-		l := labelFromEdit(evt)
-		if evt.FromFullSync && labelSyncFor(s.id).addLabel(l) {
+		if s.mgr == nil || s.mgr.store == nil {
 			return
 		}
-		if err := s.mgr.store.upsertLabel(ctx, s.id, l); err != nil {
-			s.log.Warn("etiqueta: falha ao gravar", "label", l.ID, "err", err)
-		}
+		l := labelFromEdit(evt)
 		if !evt.FromFullSync {
 			s.dispatchWebhook("label", labelWebhookData(l))
 		}
+		// Enquanto um full sync roda, tudo vai para o balde (na ordem em que
+		// chega) e entra no espelho de uma vez, junto com o snapshot.
+		if labelSyncFor(s.id).addLabel(l) {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), labelEventDBTimeout)
+		defer cancel()
+		if err := s.mgr.store.upsertLabel(ctx, s.id, l); err != nil {
+			s.log.Warn("etiqueta: falha ao gravar", "label", l.ID, "err", err)
+		}
 	case *events.LabelAssociationChat:
-		if evt.JID.IsEmpty() {
+		if s.mgr == nil || s.mgr.store == nil || evt.JID.IsEmpty() {
 			return
 		}
 		labeled := evt.Action.GetLabeled()
-		if evt.FromFullSync {
-			if !labeled || labelSyncFor(s.id).addChat(labelChat{LabelID: evt.LabelID, ChatJID: evt.JID.String()}) {
-				return
-			}
-		}
-		if err := s.mgr.store.setChatLabel(ctx, s.id, evt.LabelID, evt.JID.String(), labeled); err != nil {
-			s.log.Warn("etiqueta: falha ao gravar conversa", "label", evt.LabelID, "err", err)
-		}
+		chat := evt.JID.String()
+		ctx, cancel := context.WithTimeout(context.Background(), labelEventDBTimeout)
+		defer cancel()
 		if !evt.FromFullSync {
 			name := ""
 			if l, err := s.mgr.store.getLabel(ctx, s.id, evt.LabelID); err == nil {
@@ -529,16 +724,38 @@ func (s *Session) handleLabelEvent(rawEvt any) {
 			}
 			phone := ""
 			if evt.JID.Server != types.GroupServer {
-				phone, _ = s.resolvePeer(evt.JID.String())
+				phone, _ = s.resolvePeer(chat)
 			}
 			s.dispatchWebhook("chat_label", chatLabelWebhookData(evt.JID, phone, evt.LabelID, name, labeled))
 		}
-	case *events.PairSuccess, *events.LoggedOut:
-		// outra conta (ou nenhuma) neste dispositivo: o espelho antigo não vale mais
-		if err := s.mgr.store.clearLabels(ctx, s.id); err != nil {
-			s.log.Warn("etiqueta: falha ao limpar o espelho", "err", err)
+		if labelSyncFor(s.id).addChat(labelChat{LabelID: evt.LabelID, ChatJID: chat}, labeled) {
+			return
 		}
+		if err := s.mgr.store.setChatLabel(ctx, s.id, evt.LabelID, chat, labeled); err != nil {
+			s.log.Warn("etiqueta: falha ao gravar conversa", "label", evt.LabelID, "err", err)
+		}
+	case *events.PairSuccess, *events.LoggedOut:
+		if s.mgr == nil || s.mgr.store == nil {
+			return
+		}
+		// Outra conta (ou nenhuma) neste dispositivo: o espelho antigo não vale
+		// mais. Fora do caminho do evento, para um banco lento não atrasar o
+		// tratamento de login/logout que vem logo depois.
+		store, sid, log := s.mgr.store, s.id, s.log
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), labelEventDBTimeout)
+			defer cancel()
+			if err := store.clearLabels(ctx, sid); err != nil {
+				log.Warn("etiqueta: falha ao limpar o espelho", "err", err)
+			}
+		}()
 	}
+}
+
+// dropLabels esquece tudo o que há de etiqueta de uma sessão apagada.
+func (m *SessionManager) dropLabels(ctx context.Context, sid string) {
+	_ = m.store.clearLabels(ctx, sid)
+	labelSyncs.Delete(sid)
 }
 
 // ---------- operações na conta ----------
@@ -551,84 +768,212 @@ func (s *Session) labelsClient() (*whatsmeow.Client, error) {
 	return cli, nil
 }
 
-// syncLabels lê do WhatsApp todas as etiquetas e conversas etiquetadas da conta
-// e troca o espelho. É um full sync da coleção `regular` do app state.
-func (s *Session) syncLabels(ctx context.Context) error {
+// lockLabels pega a trava de etiquetas da sessão. Quem chama deve soltá-la.
+func (s *Session) lockLabels() *labelSync {
+	ls := labelSyncFor(s.id)
+	ls.run.Lock()
+	return ls
+}
+
+func labelMirrorFresh(syncedAt int64) bool {
+	if syncedAt <= 0 {
+		return false
+	}
+	return labelMirrorMaxAge <= 0 || time.Since(time.UnixMilli(syncedAt)) < labelMirrorMaxAge
+}
+
+// syncLabelsLocked lê do WhatsApp todas as etiquetas e conversas etiquetadas da
+// conta e troca o espelho. É um full sync da coleção `regular` do app state.
+// Exige a trava da sessão.
+func (s *Session) syncLabelsLocked(ctx context.Context, ls *labelSync) (err error) {
 	cli, err := s.labelsClient()
 	if err != nil {
 		return err
 	}
-	ls := labelSyncFor(s.id)
-	ls.run.Lock()
-	defer ls.run.Unlock()
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), labelSyncTimeout)
+	ls.lastAttempt = time.Now()
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), labelSyncTimeout)
 	defer cancel()
+	// gravações do espelho com prazo próprio: o full sync pode ter gasto o dele
+	dbCtx, cancelDB := context.WithTimeout(context.WithoutCancel(ctx), labelSendTimeout)
+	defer cancelDB()
 
 	ls.begin()
+	defer func() {
+		ls.lastErr = err
+		if err != nil {
+			ls.drain(true)
+			// Uma leitura que falhou pode ter aplicado patches sem emitir os
+			// eventos; o espelho deixa de ser confiável até a próxima dar certo.
+			if e := s.mgr.store.markLabelsUnsynced(dbCtx, s.id); e != nil {
+				s.log.Warn("etiqueta: falha ao invalidar o espelho", "err", e)
+			}
+		}
+	}()
+
 	// O whatsmeow só emite os eventos de um full sync com este flag ligado. Fica
 	// ligado só durante este sync, para não mudar o pareamento das sessões.
 	prev := cli.EmitAppStateEventsOnFullSync
 	cli.EmitAppStateEventsOnFullSync = true
-	err = cli.FetchAppState(ctx, appstate.WAPatchRegular, true, false)
-	cli.EmitAppStateEventsOnFullSync = prev
-	labels, chats := ls.take()
+	func() {
+		defer func() { cli.EmitAppStateEventsOnFullSync = prev }()
+		err = cli.FetchAppState(fetchCtx, appstate.WAPatchRegular, true, false)
+	}()
 	if err != nil {
 		return err
 	}
-	if err := s.mgr.store.replaceLabels(ctx, s.id, labels, chats); err != nil {
+	labels, chatMap := ls.drain(false)
+	chats := labeledChats(chatMap)
+	if err = labelStoreErr(s.mgr.store.replaceLabels(dbCtx, s.id, labels, chats)); err != nil {
 		return err
+	}
+	// O que chegou enquanto o espelho era trocado entra por cima, na ordem.
+	lateLabels, lateChats := ls.drain(true)
+	for _, l := range lateLabels {
+		if e := s.mgr.store.upsertLabel(dbCtx, s.id, l); e != nil {
+			s.log.Warn("etiqueta: falha ao gravar", "label", l.ID, "err", e)
+		}
+	}
+	for c, on := range lateChats {
+		if e := s.mgr.store.setChatLabel(dbCtx, s.id, c.LabelID, c.ChatJID, on); e != nil {
+			s.log.Warn("etiqueta: falha ao gravar conversa", "label", c.LabelID, "err", e)
+		}
 	}
 	s.log.Info("etiquetas sincronizadas", "labels", len(labels), "chats", len(chats))
 	return nil
 }
 
-// ensureLabelsSynced faz o primeiro full sync da sessão, se ainda não houve.
+// ensureLabelsLocked garante um espelho válido, relendo do WhatsApp se ele
+// nunca foi lido ou venceu. Exige a trava da sessão.
+func (s *Session) ensureLabelsLocked(ctx context.Context, ls *labelSync) error {
+	at, err := s.mgr.store.labelsSyncedAt(ctx, s.id)
+	if err != nil {
+		return labelStoreErr(err)
+	}
+	if labelMirrorFresh(at) {
+		return nil
+	}
+	if ls.lastErr != nil && time.Since(ls.lastAttempt) < labelSyncBackoff {
+		if at > 0 {
+			return nil // espelho vencido mas legível: serve enquanto espera
+		}
+		return fmt.Errorf("%w (%v)", errLabelSyncWait, ls.lastErr)
+	}
+	err = s.syncLabelsLocked(ctx, ls)
+	if err != nil && at > 0 && errors.Is(err, errLabelsOffline) {
+		return nil // sessão fora do ar: o espelho que existe ainda serve para leitura
+	}
+	return err
+}
+
+// ensureLabelsSynced é a versão para leituras: só pega a trava se o espelho
+// precisar ser relido.
 func (s *Session) ensureLabelsSynced(ctx context.Context) error {
 	at, err := s.mgr.store.labelsSyncedAt(ctx, s.id)
 	if err != nil {
-		return err
+		return labelStoreErr(err)
 	}
-	if at > 0 {
+	if labelMirrorFresh(at) {
 		return nil
 	}
-	return s.syncLabels(ctx)
+	ls := s.lockLabels()
+	defer ls.run.Unlock()
+	return s.ensureLabelsLocked(ctx, ls)
 }
 
-func (s *Session) sendLabelPatch(ctx context.Context, patch appstate.PatchInfo) error {
+// forceLabelSync relê tudo a pedido, respeitando o intervalo mínimo e a espera
+// depois de uma falha.
+func (s *Session) forceLabelSync(ctx context.Context) error {
+	ls := s.lockLabels()
+	defer ls.run.Unlock()
+	if since := time.Since(ls.lastAttempt); !ls.lastAttempt.IsZero() {
+		if ls.lastErr == nil && since < labelSyncMinInterval {
+			return nil
+		}
+		if ls.lastErr != nil && since < labelSyncBackoff {
+			return fmt.Errorf("%w (%v)", errLabelSyncWait, ls.lastErr)
+		}
+	}
+	return s.syncLabelsLocked(ctx, ls)
+}
+
+// writeLabels roda uma escrita de etiqueta com a sessão travada, o espelho
+// válido e a coleção `regular` com versão local (sem ela o patch sairia contra
+// um estado vazio).
+func (s *Session) writeLabels(ctx context.Context, fn func(ctx context.Context, cli *whatsmeow.Client) error) error {
 	cli, err := s.labelsClient()
 	if err != nil {
 		return err
 	}
+	ls := s.lockLabels()
+	defer ls.run.Unlock()
+	if err := s.ensureLabelsLocked(ctx, ls); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), labelSendTimeout)
 	defer cancel()
-	return cli.SendAppState(ctx, patch)
+	version, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(appstate.WAPatchRegular))
+	if err != nil {
+		return err
+	}
+	if version == 0 {
+		return errLabelNotReady
+	}
+	return fn(ctx, cli)
 }
 
 // createLabel cria a etiqueta; se já existe uma viva com o mesmo nome, devolve
 // ela (created=false) em vez de duplicar.
 func (s *Session) createLabel(ctx context.Context, name string, color int32) (l waLabel, created bool, err error) {
-	if err = s.ensureLabelsSynced(ctx); err != nil {
-		return
-	}
-	known, err := s.mgr.store.listLabels(ctx, s.id, true)
-	if err != nil {
-		return
-	}
-	if found, ok := findLabelByName(known, name); ok {
-		return found, false, nil
-	}
-	if countLiveLabels(known) >= labelMaxPerAccount {
-		return l, false, errLabelLimit
-	}
-	l = waLabel{ID: nextLabelID(known), Name: name, Color: color}
-	if err = s.sendLabelPatch(ctx, buildLabelEditPatch(l)); err != nil {
-		return
-	}
-	return l, true, s.mgr.store.upsertLabel(ctx, s.id, l)
+	err = s.writeLabels(ctx, func(ctx context.Context, cli *whatsmeow.Client) error {
+		known, err := s.mgr.store.listLabels(ctx, s.id)
+		if err != nil {
+			return labelStoreErr(err)
+		}
+		if found, ok := findLabelByName(known, name); ok {
+			l = found
+			return nil
+		}
+		if len(userLabels(known)) >= labelMaxPerAccount {
+			return errLabelLimit
+		}
+		l = newLabel(nextLabelID(known), newLabelAction(name, color, known))
+		if err := cli.SendAppState(ctx, buildLabelEditPatch(l.ID, l.act)); err != nil {
+			return err
+		}
+		created = true
+		return labelStoreErr(s.mgr.store.upsertLabel(ctx, s.id, l))
+	})
+	return
+}
+
+// editLabel renomeia/recolore (name/color não nulos) ou apaga a etiqueta.
+func (s *Session) editLabel(ctx context.Context, id string, name *string, color *int32, del bool) (l waLabel, err error) {
+	err = s.writeLabels(ctx, func(ctx context.Context, cli *whatsmeow.Client) error {
+		var err error
+		if l, err = s.mgr.store.getLabel(ctx, s.id, id); err != nil {
+			return err
+		}
+		if !l.isUserLabel() || l.Immutable {
+			return errLabelSystem
+		}
+		if name != nil {
+			l.Name = *name
+		}
+		if color != nil {
+			l.Color = *color
+		}
+		l.Deleted = del
+		l.act = editedLabelAction(l)
+		if err := cli.SendAppState(ctx, buildLabelEditPatch(l.ID, l.act)); err != nil {
+			return err
+		}
+		return labelStoreErr(s.mgr.store.upsertLabel(ctx, s.id, l))
+	})
+	return
 }
 
 // labelChatTarget resolve o JID sob o qual a conversa é etiquetada.
-func (s *Session) labelChatTarget(ctx context.Context, chat types.JID, asked string) (types.JID, error) {
+func (s *Session) labelChatTarget(ctx context.Context, cli *whatsmeow.Client, chat types.JID, asked string) (types.JID, error) {
 	switch chat.Server {
 	case types.GroupServer:
 		return chat, nil
@@ -639,9 +984,9 @@ func (s *Session) labelChatTarget(ctx context.Context, chat types.JID, asked str
 	chat = chat.ToNonAD()
 	lidSeen, pnSeen, err := s.mgr.store.labelAddressingCounts(ctx, s.id)
 	if err != nil {
-		return types.JID{}, err
+		return types.JID{}, labelStoreErr(err)
 	}
-	want := pickLabelAddressing(asked, lidSeen, pnSeen, s.client.Store.LIDMigrationTimestamp > 0)
+	want := pickLabelAddressing(asked, lidSeen, pnSeen, cli.Store.LIDMigrationTimestamp > 0)
 	have := "pn"
 	if chat.Server == types.HiddenUserServer {
 		have = "lid"
@@ -651,39 +996,68 @@ func (s *Session) labelChatTarget(ctx context.Context, chat types.JID, asked str
 	}
 	// troca de forma só quando o par telefone/LID é conhecido; senão fica o pedido
 	if want == "lid" {
-		if lid, err := s.client.Store.LIDs.GetLIDForPN(ctx, chat); err == nil && lid.User != "" {
+		if lid, err := cli.Store.LIDs.GetLIDForPN(ctx, chat); err == nil && lid.User != "" {
 			return lid.ToNonAD(), nil
 		}
-	} else if pn, err := s.client.Store.LIDs.GetPNForLID(ctx, chat); err == nil && pn.User != "" {
+	} else if pn, err := cli.Store.LIDs.GetPNForLID(ctx, chat); err == nil && pn.User != "" {
 		return pn.ToNonAD(), nil
 	}
 	return chat, nil
 }
 
-// setChatLabel aplica (ou tira) a etiqueta da conversa e devolve o JID usado.
-func (s *Session) setChatLabel(ctx context.Context, chat types.JID, labelID, asked string, labeled bool) (types.JID, error) {
-	if err := s.ensureLabelsSynced(ctx); err != nil {
-		return types.JID{}, err
+// setChatLabel aplica (ou tira) a etiqueta da conversa e devolve os JIDs usados.
+//
+// A mesma conversa pode estar etiquetada sob o telefone ou sob o LID. Para
+// aplicar, vale a forma que já está no espelho (ou a regra de endereço, se a
+// conversa ainda não tem a etiqueta). Para tirar, o patch cobre TODAS as formas
+// etiquetadas: tirar só de uma deixaria a etiqueta no aparelho.
+func (s *Session) setChatLabel(ctx context.Context, chat types.JID, labelID, asked string, labeled bool) (used []string, err error) {
+	if chat.Server != types.GroupServer && chat.Server != types.DefaultUserServer && chat.Server != types.HiddenUserServer {
+		return nil, errLabelBadTarget
 	}
-	if _, err := s.mgr.store.getLabel(ctx, s.id, labelID); err != nil {
-		return types.JID{}, err
-	}
-	target, err := s.labelChatTarget(ctx, chat, asked)
-	if err != nil {
-		return types.JID{}, err
-	}
-	if err := s.sendLabelPatch(ctx, appstate.BuildLabelChat(target, labelID, labeled)); err != nil {
-		return types.JID{}, err
-	}
-	if !labeled {
-		// tira também de um registro antigo sob o outro endereço da mesma conversa
-		for _, alias := range s.chatAliases(chat) {
-			if alias != target.String() {
-				_ = s.mgr.store.setChatLabel(ctx, s.id, labelID, alias, false)
+	err = s.writeLabels(ctx, func(ctx context.Context, cli *whatsmeow.Client) error {
+		l, err := s.mgr.store.getLabel(ctx, s.id, labelID)
+		if err != nil {
+			return err
+		}
+		if !l.isUserLabel() {
+			return errLabelSystem
+		}
+		current, err := s.mgr.store.labeledAliases(ctx, s.id, labelID, s.chatAliases(chat.ToNonAD()))
+		if err != nil {
+			return labelStoreErr(err)
+		}
+		var targets []types.JID
+		for _, a := range current {
+			if j, err := types.ParseJID(a); err == nil {
+				targets = append(targets, j)
 			}
 		}
-	}
-	return target, s.mgr.store.setChatLabel(ctx, s.id, labelID, target.String(), labeled)
+		if len(targets) == 0 || (asked != "" && labeled) {
+			t, err := s.labelChatTarget(ctx, cli, chat, asked)
+			if err != nil {
+				return err
+			}
+			if labeled {
+				targets = []types.JID{t}
+			} else {
+				targets = append(targets, t)
+			}
+		} else if labeled {
+			targets = targets[:1]
+		}
+		if err := cli.SendAppState(ctx, buildLabelChatsPatch(labelID, targets, labeled)); err != nil {
+			return err
+		}
+		for _, t := range targets {
+			used = append(used, t.String())
+			if err := s.mgr.store.setChatLabel(ctx, s.id, labelID, t.String(), labeled); err != nil {
+				return labelStoreErr(err)
+			}
+		}
+		return nil
+	})
+	return
 }
 
 // ---------- HTTP ----------
@@ -693,12 +1067,18 @@ func writeLabelError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errLabelNotFound):
 		code = http.StatusNotFound
-	case errors.Is(err, errLabelsOffline), errors.Is(err, errLabelLimit):
+	case errors.Is(err, errLabelsOffline), errors.Is(err, errLabelLimit), errors.Is(err, errLabelSystem):
 		code = http.StatusConflict
-	case errors.Is(err, errLabelName), errors.Is(err, errLabelColor), errors.Is(err, errLabelBadTarget):
+	case errors.Is(err, errLabelName), errors.Is(err, errLabelColor), errors.Is(err, errLabelBadTarget), errors.Is(err, errLabelAddressing):
 		code = http.StatusBadRequest
 	case errors.Is(err, whatsmeow.ErrAppStateRateLimited):
 		code = http.StatusTooManyRequests
+		w.Header().Set("Retry-After", "60")
+	case errors.Is(err, errLabelSyncWait), errors.Is(err, errLabelNotReady):
+		code = http.StatusServiceUnavailable
+		w.Header().Set("Retry-After", strconv.Itoa(int(labelSyncBackoff.Seconds())))
+	case errors.Is(err, errLabelStore):
+		code = http.StatusInternalServerError
 	}
 	writeJSON(w, code, map[string]string{"error": err.Error()})
 }
@@ -708,17 +1088,32 @@ type labelsResponse struct {
 	Labels   []waLabel `json:"labels"`
 }
 
-func (s *server) writeLabels(w http.ResponseWriter, r *http.Request, sess *Session) {
-	labels, err := s.sessions.store.listLabels(r.Context(), sess.id, r.URL.Query().Get("deleted") == "true")
+// writeLabelList responde a lista. Por padrão só as etiquetas de usuário vivas;
+// ?all=true traz também as apagadas e as listas do WhatsApp; ?raw=true inclui o
+// registro completo de cada uma no app state.
+func (s *server) writeLabelList(w http.ResponseWriter, r *http.Request, sess *Session) {
+	labels, err := s.sessions.store.listLabels(r.Context(), sess.id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeLabelError(w, labelStoreErr(err))
 		return
+	}
+	if r.URL.Query().Get("all") != "true" {
+		labels = userLabels(labels)
+	}
+	if r.URL.Query().Get("raw") == "true" {
+		for i := range labels {
+			if labels[i].act != nil {
+				if b, err := protojson.Marshal(labels[i].act); err == nil {
+					labels[i].Action = b
+				}
+			}
+		}
 	}
 	at, _ := s.sessions.store.labelsSyncedAt(r.Context(), sess.id)
 	writeJSON(w, http.StatusOK, labelsResponse{SyncedAt: at, Labels: labels})
 }
 
-// GET /api/sessions/{sid}/labels?deleted=  → etiquetas da conta
+// GET /api/sessions/{sid}/labels?all=&raw=  → etiquetas da conta
 // Na primeira chamada da sessão lê as etiquetas do WhatsApp (full sync).
 func (s *server) handleListLabels(w http.ResponseWriter, r *http.Request) {
 	sess := s.sessionByID(w, r.PathValue("sid"))
@@ -729,7 +1124,7 @@ func (s *server) handleListLabels(w http.ResponseWriter, r *http.Request) {
 		writeLabelError(w, err)
 		return
 	}
-	s.writeLabels(w, r, sess)
+	s.writeLabelList(w, r, sess)
 }
 
 // POST /api/sessions/{sid}/labels/sync  → relê tudo do WhatsApp e devolve a lista
@@ -738,18 +1133,11 @@ func (s *server) handleSyncLabels(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	at, err := s.sessions.store.labelsSyncedAt(r.Context(), sess.id)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	if err := sess.forceLabelSync(r.Context()); err != nil {
+		writeLabelError(w, err)
 		return
 	}
-	if time.Since(time.UnixMilli(at)) >= labelSyncMinInterval {
-		if err := sess.syncLabels(r.Context()); err != nil {
-			writeLabelError(w, err)
-			return
-		}
-	}
-	s.writeLabels(w, r, sess)
+	s.writeLabelList(w, r, sess)
 }
 
 type labelBody struct {
@@ -757,9 +1145,9 @@ type labelBody struct {
 	Color *int32  `json:"color"`
 }
 
-func readLabelBody(r *http.Request) (labelBody, error) {
+func readLabelBody(w http.ResponseWriter, r *http.Request) (labelBody, error) {
 	var b labelBody
-	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, labelBodyMaxBytes)).Decode(&b); err != nil {
 		return b, errors.New("payload inválido")
 	}
 	if b.Name != nil {
@@ -782,7 +1170,7 @@ func (s *server) handleCreateLabel(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	b, err := readLabelBody(r)
+	b, err := readLabelBody(w, r)
 	if err == nil && b.Name == nil {
 		err = errLabelName
 	}
@@ -813,32 +1201,14 @@ func (s *server) handleUpdateLabel(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	b, err := readLabelBody(r)
+	b, err := readLabelBody(w, r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := sess.ensureLabelsSynced(r.Context()); err != nil {
-		writeLabelError(w, err)
-		return
-	}
-	l, err := s.sessions.store.getLabel(r.Context(), sess.id, r.PathValue("labelId"))
+	l, err := sess.editLabel(r.Context(), r.PathValue("labelId"), b.Name, b.Color, false)
 	if err != nil {
 		writeLabelError(w, err)
-		return
-	}
-	if b.Name != nil {
-		l.Name = *b.Name
-	}
-	if b.Color != nil {
-		l.Color = *b.Color
-	}
-	if err := sess.sendLabelPatch(r.Context(), buildLabelEditPatch(l)); err != nil {
-		writeLabelError(w, err)
-		return
-	}
-	if err := s.sessions.store.upsertLabel(r.Context(), sess.id, l); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, l)
@@ -850,28 +1220,15 @@ func (s *server) handleDeleteLabel(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	if err := sess.ensureLabelsSynced(r.Context()); err != nil {
-		writeLabelError(w, err)
-		return
-	}
-	l, err := s.sessions.store.getLabel(r.Context(), sess.id, r.PathValue("labelId"))
+	l, err := sess.editLabel(r.Context(), r.PathValue("labelId"), nil, nil, true)
 	if err != nil {
 		writeLabelError(w, err)
-		return
-	}
-	l.Deleted = true
-	if err := sess.sendLabelPatch(r.Context(), buildLabelEditPatch(l)); err != nil {
-		writeLabelError(w, err)
-		return
-	}
-	if err := s.sessions.store.upsertLabel(r.Context(), sess.id, l); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"id": l.ID, "deleted": true})
 }
 
-// GET /api/sessions/{sid}/labels/{labelId}/chats  → conversas com a etiqueta
+// GET /api/sessions/{sid}/labels/{labelId}/chats?limit=&offset=  → conversas com a etiqueta
 func (s *server) handleLabelChats(w http.ResponseWriter, r *http.Request) {
 	sess := s.sessionByID(w, r.PathValue("sid"))
 	if sess == nil {
@@ -886,9 +1243,10 @@ func (s *server) handleLabelChats(w http.ResponseWriter, r *http.Request) {
 		writeLabelError(w, err)
 		return
 	}
-	jids, err := s.sessions.store.chatsOfLabel(r.Context(), sess.id, l.ID)
+	limit, offset := queryPage(r, 200)
+	jids, err := s.sessions.store.chatsOfLabel(r.Context(), sess.id, l.ID, limit, offset)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeLabelError(w, labelStoreErr(err))
 		return
 	}
 	type chatRef struct {
@@ -924,7 +1282,7 @@ func (s *server) handleChatLabels(w http.ResponseWriter, r *http.Request) {
 	}
 	labels, err := s.sessions.store.labelsOfChat(r.Context(), sess.id, sess.chatAliases(chat.ToNonAD()))
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeLabelError(w, labelStoreErr(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, labels)
@@ -946,12 +1304,21 @@ func (s *server) handleSetChatLabel(labeled bool) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		addressing := r.URL.Query().Get("addressing")
+		if !validLabelAddressing(addressing) {
+			writeLabelError(w, errLabelAddressing)
+			return
+		}
 		labelID := r.PathValue("labelId")
-		target, err := sess.setChatLabel(r.Context(), chat, labelID, r.URL.Query().Get("addressing"), labeled)
+		used, err := sess.setChatLabel(r.Context(), chat, labelID, addressing, labeled)
 		if err != nil {
 			writeLabelError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"chat": target.String(), "labelId": labelID, "labeled": labeled})
+		first := ""
+		if len(used) > 0 {
+			first = used[0]
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"chat": first, "chats": used, "labelId": labelID, "labeled": labeled})
 	}
 }
